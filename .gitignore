@@ -14,3 +14,5 @@ release.properties
 *.iws
 *.iml
 *.ipr
+/.metadata/
+/.sonarlint/
