@@ -486,6 +486,9 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
      *            the EObject
      */
     private void deserializeEReference(EReference eReference, JsonElement value, EObject eObject) {
+        if (eReference.isTransient()) {
+            return;
+        }
         if (eReference.isContainment()) {
             if (eReference.isMany()) {
                 this.deserializeMultipleContainmentEReference(eReference, value, eObject);
@@ -941,6 +944,9 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
      *            the given EObject
      */
     private void deserializeEAttribute(EAttribute eAttribute, JsonElement jsonElement, EObject eObject) {
+        if (eAttribute.isTransient()) {
+            return;
+        }
         EDataType dataType = eAttribute.getEAttributeType();
         if (!eAttribute.isMany()) {
             Object value = null;
