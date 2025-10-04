@@ -59,6 +59,7 @@ import org.eclipse.sirius.emfjson.resource.JsonResource.IEObjectHandler;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IJsonResourceProcessor;
 import org.eclipse.sirius.emfjson.resource.JsonResource.URIHandler;
 import org.eclipse.sirius.emfjson.resource.PackageNotFoundError;
+import org.eclipse.sirius.emfjson.resource.UnknownFeatureError;
 
 /**
  * The Gson deserializer is responsible for the deserialization of EObjects.
@@ -470,6 +471,8 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
                     this.deserializeEAttribute((EAttribute) eStructuralFeature, entry.getValue(), eObject);
                 } else if (eStructuralFeature instanceof EReference) {
                     this.deserializeEReference((EReference) eStructuralFeature, entry.getValue(), eObject);
+                } else {
+                    this.helper.getResource().getErrors().add(new UnknownFeatureError(eClass.getName(), entry.getKey(), this.helper.getResourceURI().toString()));
                 }
             }
         }
