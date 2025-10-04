@@ -54,6 +54,7 @@ import org.eclipse.emf.ecore.util.BasicExtendedMetaData;
 import org.eclipse.emf.ecore.util.EcoreUtil;
 import org.eclipse.emf.ecore.util.ExtendedMetaData;
 import org.eclipse.emf.ecore.util.InternalEList;
+import org.eclipse.sirius.emfjson.resource.UnresolvedReferenceError;
 import org.eclipse.sirius.emfjson.resource.JsonResource;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IEObjectHandler;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IJsonResourceProcessor;
@@ -325,7 +326,8 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
             if (obj != null) {
                 EStructuralFeature feature = ref.getFeature();
                 this.setFeatureValue(ref.getObject(), feature, obj, ref.getPosition());
-
+            } else {
+                this.helper.getResource().getErrors().add(new UnresolvedReferenceError((String) ref.getValue(), this.helper.getResourceURI().toString()));
             }
         }
     }
