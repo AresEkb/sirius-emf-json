@@ -58,6 +58,7 @@ import org.eclipse.sirius.emfjson.resource.JsonResource;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IEObjectHandler;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IJsonResourceProcessor;
 import org.eclipse.sirius.emfjson.resource.JsonResource.URIHandler;
+import org.eclipse.sirius.emfjson.resource.PackagePrefixNotDefinedError;
 import org.eclipse.sirius.emfjson.resource.PackageNotFoundError;
 
 /**
@@ -1087,6 +1088,10 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
         }
 
         String nsUri = this.prefixToNsURi.get(nsPrefix);
+
+        if (nsUri == null) {
+            this.helper.getResource().getErrors().add(new PackagePrefixNotDefinedError(nsPrefix, this.helper.getResourceURI().toString()));
+        }
 
         EPackage ePackage = null;
         if (this.resourceSet != null) {
