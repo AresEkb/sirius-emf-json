@@ -324,7 +324,7 @@ public class JsonResourceImpl extends ResourceImpl implements JsonResource {
                 handler.postLoad(this, inputStream, loadOptions);
             }
         } catch (JsonIOException | JsonSyntaxException e) {
-            e.printStackTrace();
+            throw new IOException(e);
         }  finally {
             if (reader != null) {
                 reader.close();
