@@ -361,8 +361,25 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
                 if (eGet instanceof InternalEList<?>) {
                     @SuppressWarnings("unchecked")
                     InternalEList<Object> list = (InternalEList<Object>) eGet;
-                    if (!list.contains(value)) {
-                        list.addUnique(position, value);
+                    if (!isSetByInverse(object, feature, value)) {
+                        // Not present - always the case for a unidirectional
+                        // reference. Append at the JSON position, clamped so
+                        // entries deferred as forward refs do not overshoot. The
+                        // list is not scanned, so a large aggregate whose faces
+                        // or indices number in the tens of thousands stays linear.
+                        int insertIndex = Math.min(position, list.size());
+                        list.addUnique(insertIndex, value);
+                    } else {
+                        // Value was already pulled into the list by an eOpposite
+                        // update; honour the JSON array order by moving it to the
+                        // recorded position. Only a bidirectional reference reaches
+                        // here, and its list is small, so locating the value with
+                        // indexOf is not a scaling concern.
+                        int currentIndex = list.indexOf(value);
+                        int targetIndex = Math.min(position, list.size() - 1);
+                        if (currentIndex >= 0 && currentIndex != targetIndex) {
+                            list.move(targetIndex, currentIndex);
+                        }
                     }
                 }
             } else {
@@ -370,6 +387,34 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
             }
         }
 
+    }
+
+    /**
+     * Tells whether the value is already held by the object's many-valued feature
+     * through inverse maintenance, so adding it again would duplicate it. A value
+     * can only be pre-populated when the feature is one side of a bidirectional
+     * reference and the opposite side was set first; that is detected on the
+     * value's own opposite feature, so the object's - possibly huge - list is
+     * never scanned. A unidirectional feature is never pre-populated, since the
+     * JSON array is unique and nothing else feeds the list.
+     *
+     * @param owner
+     *            the object holding the feature
+     * @param feature
+     *            the many-valued feature being deserialized
+     * @param value
+     *            the value about to be added
+     * @return true when the value is already present through the opposite feature
+     */
+    private static boolean isSetByInverse(EObject owner, EStructuralFeature feature, Object value) {
+        EReference opposite = feature instanceof EReference reference ? reference.getEOpposite() : null;
+        if (opposite == null || !(value instanceof EObject element)) {
+            return false;
+        }
+        if (opposite.isMany()) {
+            return ((Collection<?>) element.eGet(opposite)).contains(owner);
+        }
+        return element.eGet(opposite) == owner;
     }
 
     /**
@@ -699,7 +744,7 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
                         SingleReference singleReference = new SingleReference(eObject, eReference, fragmentEMF, i);
                         this.forwardSingleReferences.add(singleReference);
                     } else {
-                        this.helper.setUniqueValue(eObject, eReference, object);
+                        this.setFeatureValue(eObject, eReference, object, i);
                     }
                 } else {
                     String resourceURIPath = id.substring(0, index);
@@ -712,12 +757,12 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
                     } else {
                         object = this.createProxyEObject(id, qualifiedType, eReference);
                     }
-                    this.helper.setUniqueValue(eObject, eReference, object);
+                    this.setFeatureValue(eObject, eReference, object, i);
                 }
             } else {
                 EObject resolvedEObject = this.helper.getResource().getEObject(id);
                 if (resolvedEObject != null) {
-                    this.helper.setUniqueValue(eObject, eReference, resolvedEObject);
+                    this.setFeatureValue(eObject, eReference, resolvedEObject, i);
                 } else {
                     SingleReference singleReference = new SingleReference(eObject, eReference, id, i);
                     this.forwardSingleReferences.add(singleReference);
