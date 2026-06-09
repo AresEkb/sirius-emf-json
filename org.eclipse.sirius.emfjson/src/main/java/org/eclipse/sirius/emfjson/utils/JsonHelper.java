@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2020, 2025 Obeo.
+ * Copyright (c) 2020, 2026 Obeo.
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
  * which accompanies this distribution, and is available at
@@ -22,6 +22,7 @@ import java.util.TreeMap;
 
 import org.eclipse.emf.common.util.BasicEList;
 import org.eclipse.emf.common.util.BasicEMap;
+import org.eclipse.emf.common.util.EList;
 import org.eclipse.emf.common.util.EMap;
 import org.eclipse.emf.common.util.SegmentSequence;
 import org.eclipse.emf.common.util.URI;
@@ -33,6 +34,7 @@ import org.eclipse.emf.ecore.ENamedElement;
 import org.eclipse.emf.ecore.EObject;
 import org.eclipse.emf.ecore.EPackage;
 import org.eclipse.emf.ecore.EPackage.Registry;
+import org.eclipse.emf.ecore.EReference;
 import org.eclipse.emf.ecore.EStructuralFeature;
 import org.eclipse.emf.ecore.InternalEObject;
 import org.eclipse.emf.ecore.resource.Resource;
@@ -644,10 +646,40 @@ public class JsonHelper {
         if (eGet instanceof InternalEList) {
             @SuppressWarnings("unchecked")
             InternalEList<Object> eList = (InternalEList<Object>) eGet;
-            if (!eList.contains(value)) {
+            if (!isSetByInverse(eObject, feature, value)) {
                 eList.addUnique(value);
             }
         }
+    }
+
+    /**
+     * Tells whether the value is already held by the object's many-valued
+     * feature as a result of inverse maintenance, so deserializing the feature
+     * would add a duplicate. The only way a duplicate can occur is a bidirectional
+     * reference whose opposite side was deserialized first: setting it there
+     * automatically added this value here. That is detected on the value's own
+     * opposite feature, so the object's (potentially huge) list is never scanned -
+     * a per-element scan of it would make deserializing a large aggregate
+     * quadratic. A unidirectional feature never gets a duplicate, since the JSON
+     * array is unique and nothing else populates the list.
+     *
+     * @param eObject
+     *            the object holding the feature
+     * @param feature
+     *            the many-valued feature being deserialized
+     * @param value
+     *            the value about to be added
+     * @return true when the value is already present through the opposite feature
+     */
+    public static boolean isSetByInverse(EObject eObject, EStructuralFeature feature, Object value) {
+        EReference opposite = feature instanceof EReference reference ? reference.getEOpposite() : null;
+        if (opposite == null || !(value instanceof EObject element)) {
+            return false;
+        }
+        if (opposite.isMany()) {
+            return ((EList<?>) element.eGet(opposite)).contains(eObject);
+        }
+        return element.eGet(opposite) == eObject;
     }
 
     /**
