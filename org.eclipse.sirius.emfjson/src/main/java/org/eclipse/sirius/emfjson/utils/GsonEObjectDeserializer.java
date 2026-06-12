@@ -30,7 +30,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -606,6 +605,11 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
     /**
      * Resolves a type from a qualified name (e.g. "flow:System") into the corresponding EClass (or null) using the
      * resource set's package registry.
+     * <p>
+     * The qualifier is a namespace prefix declared in the document's "ns" map, so it is resolved through that map to an
+     * nsURI and then to the registered EPackage, exactly like {@link #getEClass(JsonObject, JsonElement)}. A prefix may
+     * differ from the EPackage name, hence resolving by name only is not reliable; the name match is kept as a fallback
+     * for documents whose qualifier happens to be a package name rather than a declared prefix.
      *
      * @param qualifiedType
      *            the qualified name of the type to resolve.
@@ -615,26 +619,48 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
         if (qualifiedType != null) {
             String[] splitType = qualifiedType.split(":"); //$NON-NLS-1$
             if (splitType.length == 2) {
-                String packageName = splitType[0];
+                String prefix = splitType[0];
                 String eClassName = splitType[1];
-                Optional<EPackage> packageOpt = this.resourceSet.getPackageRegistry().values().stream()
-                        .filter(EPackage.class::isInstance)
-                        .map(EPackage.class::cast)
-                        .filter(pkg -> pkg.getName().equals(packageName))
-                        .findFirst();
-                if (packageOpt.isPresent()) {
-                    Optional<EClass> eClass = packageOpt.get().getEClassifiers().stream()
-                            .filter(clazz -> eClassName.equals(clazz.getName()))
-                            .filter(EClass.class::isInstance)
-                            .map(EClass.class::cast)
-                            .findFirst();
-                    if (eClass.isPresent()) {
-                        return eClass.get();
+                EPackage ePackage = this.resolvePackageByPrefix(prefix);
+                if (ePackage == null) {
+                    ePackage = this.resourceSet.getPackageRegistry().values().stream()
+                            .filter(EPackage.class::isInstance)
+                            .map(EPackage.class::cast)
+                            .filter(pkg -> pkg.getName().equals(prefix))
+                            .findFirst()
+                            .orElse(null);
+                }
+                if (ePackage != null) {
+                    EClassifier eClassifier = ePackage.getEClassifier(eClassName);
+                    if (eClassifier instanceof EClass) {
+                        return (EClass) eClassifier;
                     }
                 }
             }
         }
         return null;
+    }
+
+    /**
+     * Resolves the EPackage declared under the given namespace prefix in the document's "ns" map.
+     *
+     * @param prefix
+     *            the namespace prefix.
+     * @return the corresponding EPackage, or null if the prefix is not declared or its nsURI is not registered.
+     */
+    private EPackage resolvePackageByPrefix(String prefix) {
+        String nsURI = this.prefixToNsURi.get(prefix);
+        if (nsURI == null) {
+            return null;
+        }
+        EPackage ePackage = null;
+        if (this.resourceSet != null) {
+            ePackage = this.resourceSet.getPackageRegistry().getEPackage(nsURI);
+        }
+        if (ePackage == null) {
+            ePackage = this.getPackageForURI(nsURI);
+        }
+        return ePackage;
     }
 
     /**
