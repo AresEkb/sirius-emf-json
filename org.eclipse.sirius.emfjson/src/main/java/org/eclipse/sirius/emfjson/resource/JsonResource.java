@@ -130,6 +130,30 @@ public interface JsonResource extends Resource {
     String OPTION_SAVE_TRANSIENT_FEATURES = "saveTransientFeatures"; //$NON-NLS-1$
 
     /**
+     * Indicates if the resource should be loaded without building a JSON tree. <code>true</code> to stream the load,
+     * <code>false</code> otherwise (default : <code>false</code>).
+     * <p>
+     * Streaming creates each object as soon as its <code>eClass</code> is read, so it pays off only when
+     * <code>eClass</code> precedes <code>data</code>. An object serialized the other way round is still loaded
+     * correctly, by buffering its data until its class is known, but at the cost of the tree that streaming was
+     * meant to avoid. Beware of stores that reorder keys: a document round-tripped through a PostgreSQL
+     * <code>jsonb</code> column comes back with its keys ordered by length, which puts <code>data</code> first
+     * for every single object.
+     * </p>
+     */
+    String OPTION_STREAMING_LOAD = "streamingLoad"; //$NON-NLS-1$
+
+    /**
+     * Indicates if the resource should be saved without building a JSON tree. <code>true</code> to stream the save,
+     * <code>false</code> otherwise (default : <code>false</code>).
+     * <p>
+     * The order of the keys is decided here, so unlike {@link #OPTION_STREAMING_LOAD} this one has no such
+     * caveat.
+     * </p>
+     */
+    String OPTION_STREAMING_SAVE = "streamingSave"; //$NON-NLS-1$
+
+    /**
      * If this option is set to <code>true</code>, the metaType of the type is added('nsPrefix:metaType'). (default :
      * <code>false</code>).
      */

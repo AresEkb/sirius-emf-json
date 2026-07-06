@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2020, 2025 Obeo.
+ * Copyright (c) 2020, 2026 Obeo.
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
  * which accompanies this distribution, and is available at
@@ -20,8 +20,10 @@ import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import com.google.gson.stream.MalformedJsonException;
 
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -308,9 +310,7 @@ public class JsonResourceImpl extends ResourceImpl implements JsonResource {
             // nothing
         };
 
-        GsonBuilder gsonBuilder = new GsonBuilder();
-        gsonBuilder.registerTypeAdapter(List.class, new GsonEObjectDeserializer(this, loadOptions));
-        Gson gson = gsonBuilder.disableHtmlEscaping().create();
+        GsonEObjectDeserializer objectDeserializer = new GsonEObjectDeserializer(this, loadOptions);
 
         // Check if reader care of indent.
         JsonReader reader = null;
@@ -318,7 +318,23 @@ public class JsonResourceImpl extends ResourceImpl implements JsonResource {
         try {
             reader = new JsonReader(new InputStreamReader(inputStream, encoding.toString()));
 
-            gson.fromJson(reader, typeToken.getType());
+            if (objectDeserializer.canStream()) {
+                try {
+                    objectDeserializer.read(reader);
+                } catch (MalformedJsonException | EOFException | IllegalStateException | NumberFormatException e) {
+                    // Gson reports malformed input as a JsonSyntaxException, so that is what
+                    // the tree-based branch below throws. The streaming reader surfaces the
+                    // raw parser failure instead, which would make the error depend on the
+                    // branch taken, an internal detail. A genuine I/O failure is deliberately
+                    // left alone rather than reported as a syntax error.
+                    throw new JsonSyntaxException(e);
+                }
+            } else {
+                GsonBuilder gsonBuilder = new GsonBuilder();
+                gsonBuilder.registerTypeAdapter(List.class, objectDeserializer);
+                Gson gson = gsonBuilder.disableHtmlEscaping().create();
+                gson.fromJson(reader, typeToken.getType());
+            }
 
             if (handler != null) {
                 handler.postLoad(this, inputStream, loadOptions);
@@ -368,10 +384,6 @@ public class JsonResourceImpl extends ResourceImpl implements JsonResource {
 
         GsonEObjectSerializer objectSerializer = new GsonEObjectSerializer(this, saveOptions);
 
-        GsonBuilder gsonBuilder = new GsonBuilder();
-        gsonBuilder.registerTypeAdapter(typeToken.getType(), objectSerializer);
-        Gson gson = gsonBuilder.disableHtmlEscaping().create();
-
         OutputStreamWriter outputStreamWriter = new OutputStreamWriter(outputStream, encoding.toString());
         JsonWriter writer = new JsonWriter(outputStreamWriter);
         if (prettyPrintingIndent instanceof String) {
@@ -379,7 +391,21 @@ public class JsonResourceImpl extends ResourceImpl implements JsonResource {
         }
         EList<EObject> resourceContents = this.getContents();
 
-        gson.toJson(resourceContents, typeToken.getType(), writer);
+        if (objectSerializer.canStream()) {
+            // Match the settings Gson applies when serializing a tree (no HTML
+            // escaping, nulls omitted), since the streaming path writes the
+            // sub-element values through Streams.write, which honors the writer's
+            // own flags rather than a Gson configuration.
+            writer.setHtmlSafe(false);
+            writer.setSerializeNulls(false);
+            objectSerializer.write(writer, resourceContents);
+            writer.flush();
+        } else {
+            GsonBuilder gsonBuilder = new GsonBuilder();
+            gsonBuilder.registerTypeAdapter(typeToken.getType(), objectSerializer);
+            Gson gson = gsonBuilder.disableHtmlEscaping().create();
+            gson.toJson(resourceContents, typeToken.getType(), writer);
+        }
 
         if (handler != null) {
             handler.postSave(this, outputStream, saveOptions);

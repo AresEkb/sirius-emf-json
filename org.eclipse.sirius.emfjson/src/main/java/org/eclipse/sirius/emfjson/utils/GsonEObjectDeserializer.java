@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2020, 2025 Obeo.
+ * Copyright (c) 2020, 2026 Obeo.
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
  * which accompanies this distribution, and is available at
@@ -19,6 +19,10 @@ import com.google.gson.JsonDeserializer;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 
 import java.io.IOException;
 import java.lang.reflect.Type;
@@ -59,6 +63,7 @@ import org.eclipse.sirius.emfjson.resource.JsonResource.IEObjectHandler;
 import org.eclipse.sirius.emfjson.resource.JsonResource.IJsonResourceProcessor;
 import org.eclipse.sirius.emfjson.resource.JsonResource.URIHandler;
 import org.eclipse.sirius.emfjson.resource.PackageNotFoundError;
+import org.eclipse.sirius.emfjson.resource.UnknownFeatureError;
 
 /**
  * The Gson deserializer is responsible for the deserialization of EObjects.
@@ -265,6 +270,264 @@ public class GsonEObjectDeserializer implements JsonDeserializer<List<EObject>> 
         this.deserializeContent(jsonRoot);
 
         return this.rootElements;
+    }
+
+    /**
+     * Whether the resource can be deserialized by reading straight from the JSON
+     * stream instead of first parsing it into a tree in memory. Streaming is used
+     * when no resource processor is registered - which for the metamodel means no
+     * migration applies to the document (a current-version document); a processor
+     * (migration) may rewrite the whole content tree in {@code preDeserialization}
+     * and therefore needs the tree materialized.
+     *
+     * @return whether streaming deserialization is applicable
+     */
+    public boolean canStream() {
+        return Boolean.TRUE.equals(this.options.get(JsonResource.OPTION_STREAMING_LOAD))
+                && this.jsonResourceProcessor instanceof IJsonResourceProcessor.NoOp;
+    }
+
+    /**
+     * Deserializes the resource by reading straight from the JSON stream, without
+     * materializing the whole content as a tree. Only the containment hierarchy is
+     * streamed; the small per-feature values (attributes, cross references) are
+     * read as individual elements and handed to the existing builders.
+     *
+     * @param reader
+     *            the reader to stream the content from
+     * @return the root elements
+     * @throws IOException
+     *             if reading from the underlying stream fails
+     */
+    public List<EObject> read(JsonReader reader) throws IOException {
+        reader.beginObject();
+        while (reader.hasNext()) {
+            String name = reader.nextName();
+            if (IGsonConstants.NS.equals(name)) {
+                JsonObject jsonNameSpace = JsonParser.parseReader(reader).getAsJsonObject();
+                for (Entry<String, JsonElement> entry : jsonNameSpace.entrySet()) {
+                    this.prefixToNsURi.put(entry.getKey(), entry.getValue().getAsString());
+                }
+            } else if (IGsonConstants.SCHEMA_LOCATION.equals(name)) {
+                this.applySchemaLocation(JsonParser.parseReader(reader).getAsJsonObject());
+            } else if (IGsonConstants.CONTENT.equals(name)) {
+                reader.beginArray();
+                while (reader.hasNext()) {
+                    this.streamLoadObject(reader, true);
+                }
+                reader.endArray();
+            } else {
+                reader.skipValue();
+            }
+        }
+        reader.endObject();
+        this.handleForwardReference();
+        return this.rootElements;
+    }
+
+    /**
+     * Applies a streamed schema-location header (registers the referenced
+     * packages), mirroring the tree-based handling.
+     *
+     * @param jsonSchemaLocation
+     *            the schema-location object
+     */
+    private void applySchemaLocation(JsonObject jsonSchemaLocation) {
+        for (Entry<String, JsonElement> entry : jsonSchemaLocation.entrySet()) {
+            String schemaLocation = entry.getValue().getAsString();
+            if (this.resourceSet != null && schemaLocation != null && schemaLocation.length() > 0) {
+                URI uri = URI.createURI(schemaLocation);
+                if (this.uriHandler != null) {
+                    uri = this.uriHandler.resolve(uri);
+                }
+                uri = this.helper.resolve(uri, this.resourceURI);
+                EPackage ePackage = this.getEPackage(uri);
+                if (ePackage != null) {
+                    this.resourceSet.getPackageRegistry().put(ePackage.getNsURI(), ePackage);
+                }
+            }
+        }
+    }
+
+    /**
+     * Streaming counterpart of {@link #loadObject(JsonObject, boolean)}. Reads one
+     * object from the stream, creating the {@link EObject} once its {@code eClass}
+     * key is seen, and streams its containment children. The object's own fields
+     * are collected into a small shell handed to the per-object hooks; its
+     * containment children are streamed, not inlined.
+     * <p>
+     * Streaming the data requires the class to be known, so it only applies when
+     * {@code eClass} precedes {@code data}. Writers are free to order the keys as
+     * they please, and a document round-tripped through a store that normalises
+     * them (PostgreSQL {@code jsonb} orders keys by length, which puts
+     * {@code data} first) arrives the other way round. Such an object is buffered
+     * and deserialized from the tree once its class is known, which costs the
+     * streaming benefit for that object but never loses its values.
+     *
+     * @param reader
+     *            the reader positioned at the object
+     * @param isTopObject
+     *            whether the object is a top-level content root
+     * @return the created object, or {@code null} when the eClass is unknown
+     * @throws IOException
+     *             if reading fails
+     */
+    private EObject streamLoadObject(JsonReader reader, boolean isTopObject) throws IOException {
+        reader.beginObject();
+        String id = null;
+        EObject eObject = null;
+        EClass eClass = null;
+        JsonObject shell = new JsonObject();
+        JsonElement deferredData = null;
+        while (reader.hasNext()) {
+            String name = reader.nextName();
+            if (IGsonConstants.ID.equals(name)) {
+                id = reader.nextString();
+                shell.addProperty(IGsonConstants.ID, id);
+            } else if (IGsonConstants.ECLASS.equals(name)) {
+                String eClassName = reader.nextString();
+                shell.addProperty(IGsonConstants.ECLASS, eClassName);
+                EClassifier eClassifier = this.getEClass(shell, new JsonPrimitive(eClassName));
+                if (eClassifier instanceof EClass) {
+                    eClass = (EClass) eClassifier;
+                    eObject = EcoreUtil.create(eClass);
+                    if (isTopObject) {
+                        this.addToContent(eObject);
+                    }
+                }
+            } else if (IGsonConstants.DATA.equals(name) && eObject != null) {
+                JsonObject shellData = new JsonObject();
+                shell.add(IGsonConstants.DATA, shellData);
+                this.streamDeserializeData(reader, eClass, eObject, shellData);
+            } else if (IGsonConstants.DATA.equals(name)) {
+                deferredData = JsonParser.parseReader(reader);
+                shell.add(IGsonConstants.DATA, deferredData);
+            } else {
+                shell.add(name, JsonParser.parseReader(reader));
+            }
+        }
+        reader.endObject();
+        if (eObject != null && deferredData != null && deferredData.isJsonObject()) {
+            this.deserializeData(deferredData.getAsJsonObject(), eClass, eObject);
+        }
+        if (eObject != null) {
+            if (this.eObjectHandler != null) {
+                this.eObjectHandler.processDeserializedContent(eObject, shell);
+            }
+            if (id != null && this.resource != null) {
+                this.resource.setID(eObject, id);
+            }
+        }
+        this.jsonResourceProcessor.postObjectLoading(this.resource, eObject, shell, isTopObject);
+        return eObject;
+    }
+
+    /**
+     * Streaming counterpart of {@link #deserializeData(JsonObject, EClass, EObject)}.
+     * Containment references recurse through {@link #streamLoadObject}; every other
+     * feature reads its (small) value and reuses the existing builder. The Ecore
+     * meta references, whose children carry no {@code eClass}, fall back to the
+     * tree-based reference builder.
+     *
+     * @param reader
+     *            the reader positioned at the data object
+     * @param eClass
+     *            the object's class
+     * @param eObject
+     *            the object being filled
+     * @param shellData
+     *            collects the object's own (non-containment) fields for the hooks
+     * @throws IOException
+     *             if reading fails
+     */
+    private void streamDeserializeData(JsonReader reader, EClass eClass, EObject eObject, JsonObject shellData)
+            throws IOException {
+        reader.beginObject();
+        while (reader.hasNext()) {
+            String featureName = reader.nextName();
+            EStructuralFeature eStructuralFeature = eClass.getEStructuralFeature(featureName);
+            if (this.extendedMetaData != null) {
+                eStructuralFeature = this.extendedMetaData.getElement(eClass, eClass.getEPackage().getNsURI(), featureName);
+            }
+            if (eStructuralFeature instanceof EReference && ((EReference) eStructuralFeature).isContainment()
+                    && !this.isTreeReference(featureName)) {
+                this.streamContainment(reader, (EReference) eStructuralFeature, eObject);
+            } else if (eStructuralFeature instanceof EAttribute || eStructuralFeature instanceof EReference) {
+                JsonElement value = JsonParser.parseReader(reader);
+                shellData.add(featureName, value);
+                if (eStructuralFeature instanceof EAttribute) {
+                    this.deserializeEAttribute((EAttribute) eStructuralFeature, value, eObject);
+                } else {
+                    this.deserializeEReference((EReference) eStructuralFeature, value, eObject);
+                }
+            } else {
+                reader.skipValue();
+                this.helper.getResource().getErrors().add(
+                        new UnknownFeatureError(eClass.getName(), featureName, this.helper.getResourceURI().toString()));
+            }
+        }
+        reader.endObject();
+    }
+
+    /**
+     * Streams the children of a containment reference straight into the owner.
+     *
+     * @param reader
+     *            the reader positioned at the reference value
+     * @param eReference
+     *            the containment reference
+     * @param eObject
+     *            the owner
+     * @throws IOException
+     *             if reading fails
+     */
+    @SuppressWarnings("unchecked")
+    private void streamContainment(JsonReader reader, EReference eReference, EObject eObject) throws IOException {
+        if (eReference.isMany()) {
+            if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+                reader.beginArray();
+                while (reader.hasNext()) {
+                    EObject child = this.streamLoadObject(reader, false);
+                    Object eGet = this.helper.getValue(eObject, eReference);
+                    if (eGet instanceof Collection<?> && child != null) {
+                        ((Collection<Object>) eGet).add(child);
+                    }
+                }
+                reader.endArray();
+            } else {
+                EObject child = this.streamLoadObject(reader, false);
+                Object eGet = this.helper.getValue(eObject, eReference);
+                if (eGet instanceof Collection<?> && child != null) {
+                    ((Collection<Object>) eGet).add(child);
+                }
+            }
+        } else if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+            EObject child = this.streamLoadObject(reader, false);
+            this.helper.setValue(eObject, eReference, child);
+        } else {
+            this.deserializeEReference(eReference, JsonParser.parseReader(reader), eObject);
+        }
+    }
+
+    /**
+     * Whether a containment reference must be read as a tree rather than streamed,
+     * because its children are implicitly typed (they carry no {@code eClass}) and
+     * are handled by the fixed-type Ecore builders.
+     *
+     * @param referenceName
+     *            the reference name
+     * @return whether the reference must be read as a tree
+     */
+    private boolean isTreeReference(String referenceName) {
+        return IGsonConstants.EANNOTATIONS.equals(referenceName) || IGsonConstants.ELITERALS.equals(referenceName)
+                || IGsonConstants.EOPERATIONS.equals(referenceName) || IGsonConstants.EPARAMETERS.equals(referenceName)
+                || IGsonConstants.ETYPEPARAMETER_ARRAY.equals(referenceName)
+                || IGsonConstants.ETYPEARGUMENTS.equals(referenceName)
+                || IGsonConstants.EGENERICEXCEPTION.equals(referenceName)
+                || IGsonConstants.ETYPEPARAMETER.equals(referenceName)
+                || IGsonConstants.EGENERICSUPERTYPES.equals(referenceName) || IGsonConstants.EBOUNDS.equals(referenceName)
+                || IGsonConstants.DETAILS.equals(referenceName) || IGsonConstants.ESUBPACKAGES.equals(referenceName)
+                || IGsonConstants.EGENERICTYPE.equals(referenceName);
     }
 
     /**

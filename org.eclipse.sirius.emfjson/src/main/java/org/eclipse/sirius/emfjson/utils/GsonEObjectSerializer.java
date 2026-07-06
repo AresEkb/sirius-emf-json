@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2020, 2025 Obeo.
+ * Copyright (c) 2020, 2026 Obeo.
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
  * which accompanies this distribution, and is available at
@@ -20,7 +20,10 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSerializationContext;
 import com.google.gson.JsonSerializer;
+import com.google.gson.internal.Streams;
+import com.google.gson.stream.JsonWriter;
 
+import java.io.IOException;
 import java.lang.reflect.Type;
 import java.security.InvalidParameterException;
 import java.text.SimpleDateFormat;
@@ -223,6 +226,274 @@ public class GsonEObjectSerializer implements JsonSerializer<List<EObject>> {
         jsonObject.add(IGsonConstants.CONTENT, data);
 
         return jsonObject;
+    }
+
+    /**
+     * Whether the resource can be serialized by streaming directly to the writer
+     * instead of first building the whole JSON tree in memory. Streaming is used
+     * for the common save path; it is disabled when a custom serialization
+     * listener is registered (such a listener is handed the fully built
+     * {@link JsonElement} of every serialized object) or when a custom
+     * {@link ExtendedMetaData} is supplied (streaming visits the model twice - to
+     * discover namespaces, then to write - which a stateful metadata would not
+     * survive; the built-in metadata is idempotent).
+     *
+     * @return whether streaming serialization is applicable
+     */
+    public boolean canStream() {
+        Object metaData = this.options.get(JsonResource.OPTION_EXTENDED_META_DATA);
+        boolean customMetaData = metaData != null && !(metaData instanceof Boolean);
+        return Boolean.TRUE.equals(this.options.get(JsonResource.OPTION_STREAMING_SAVE))
+                && this.serializationListener instanceof ISerializationListener.NoOp && !customMetaData;
+    }
+
+    /**
+     * Serializes the given contents by streaming them straight to the writer,
+     * without materializing the whole model as a JSON tree. Only the containment
+     * hierarchy - which for a large model dominates the tree - is streamed; the
+     * small per-feature values reuse the existing element builders.
+     *
+     * @param out
+     *            the writer to stream the serialized contents to
+     * @param eObjects
+     *            the contents to serialize
+     * @throws IOException
+     *             if writing to the underlying stream fails
+     */
+    public void write(JsonWriter out, List<EObject> eObjects) throws IOException {
+        // The namespace registry is populated as a side effect of serialization,
+        // yet the "ns" header must precede the content. A first, lightweight pass
+        // registers the namespaces - visiting the same objects and references, in
+        // the same order, as serialization, but skipping the (costly) attribute
+        // value conversion, which registers nothing - so the header is built once
+        // (the stateful prefix conflict numbering runs a single time) and the real
+        // pass then streams the content after it.
+        for (EObject eObject : eObjects) {
+            this.collectNamespaces(eObject);
+        }
+
+        JsonObject header = new JsonObject();
+        header.add(IGsonConstants.JSON, this.createJsonHeader());
+        header.add(IGsonConstants.NS, this.createNsHeader());
+        this.jsonResourceProcessor.postSerialization((JsonResource) this.eResource, header);
+        JsonElement schemaLocationHeader = this.createSchemaLocationHeader();
+
+        out.beginObject();
+        for (Entry<String, JsonElement> entry : header.entrySet()) {
+            out.name(entry.getKey());
+            Streams.write(entry.getValue(), out);
+        }
+        if (schemaLocationHeader != null) {
+            out.name(IGsonConstants.SCHEMA_LOCATION);
+            Streams.write(schemaLocationHeader, out);
+        }
+        out.name(IGsonConstants.CONTENT);
+        out.beginArray();
+        for (EObject eObject : eObjects) {
+            this.writeData(out, eObject);
+        }
+        out.endArray();
+        out.endObject();
+    }
+
+    /**
+     * Registers, into the namespace registry, the packages the serialization of
+     * the given object would use, without converting attribute values. It visits
+     * the same objects (recursing through containment) and cross references, in
+     * the same order, as {@link #writeData(JsonWriter, EObject)}, so the resulting
+     * namespaces and their conflict-resolved prefixes match the tree-based
+     * serializer.
+     *
+     * @param eObject
+     *            the object whose namespaces are collected
+     */
+    private void collectNamespaces(EObject eObject) {
+        if (eObject instanceof EAnnotation || eObject instanceof EOperation || eObject instanceof EParameter
+                || eObject instanceof EGenericType || eObject instanceof ETypeParameter || eObject instanceof EEnumLiteral
+                || (eObject instanceof EPackage && ((EPackage) eObject).getESuperPackage() != null)) {
+            this.createData(eObject);
+            return;
+        }
+
+        EClass eClass = eObject.eClass();
+        this.helper.getQName(eClass);
+        List<EStructuralFeature> eAllStructuralFeatures = eClass.getEAllStructuralFeatures();
+
+        Object orderFeatures = this.options.get(JsonResource.OPTION_SAVE_FEATURES_ORDER_COMPARATOR);
+        if (orderFeatures instanceof Comparator<?>) {
+            eAllStructuralFeatures = eAllStructuralFeatures.stream() //
+                    .sorted((Comparator<? super EStructuralFeature>) orderFeatures) //
+                    .collect(Collectors.toList());
+        }
+
+        for (EStructuralFeature eStructuralFeature : eAllStructuralFeatures) {
+            if (!this.shouldSerialize(eObject, eStructuralFeature)) {
+                continue;
+            }
+            this.helper.getQName(eStructuralFeature);
+            if (eStructuralFeature instanceof EReference) {
+                EReference eReference = (EReference) eStructuralFeature;
+                if (eReference.isContainment()) {
+                    Object referenceValue = this.helper.getValue(eObject, eReference);
+                    if (eReference.isMany()) {
+                        if (referenceValue instanceof Iterable<?>) {
+                            for (Object object : (Iterable<?>) referenceValue) {
+                                if (object instanceof EObject) {
+                                    this.collectNamespaces((EObject) object);
+                                }
+                            }
+                        }
+                    } else if (referenceValue instanceof EObject) {
+                        EObject child = (EObject) referenceValue;
+                        boolean crossResource = (child instanceof BasicEObjectImpl
+                                && ((BasicEObjectImpl) child).eDirectResource() != null)
+                                || child.eResource() != eObject.eResource();
+                        if (!crossResource) {
+                            this.collectNamespaces(child);
+                        }
+                    }
+                } else {
+                    // Cross references register the packages of their targets (and,
+                    // for cross-document references, their prefixes); attributes
+                    // register nothing, so only references are visited here.
+                    this.serializeEReference(eObject, eReference);
+                }
+            }
+        }
+    }
+
+    /**
+     * Streaming counterpart of {@link #createData(EObject)}. The Ecore meta
+     * objects, which only occur in (small) metamodels, fall back to the
+     * tree-based builder; regular objects are streamed field by field.
+     *
+     * @param out
+     *            the writer
+     * @param eObject
+     *            the object to serialize
+     * @throws IOException
+     *             if writing fails
+     */
+    private void writeData(JsonWriter out, EObject eObject) throws IOException {
+        if (eObject instanceof EAnnotation || eObject instanceof EOperation || eObject instanceof EParameter
+                || eObject instanceof EGenericType || eObject instanceof ETypeParameter || eObject instanceof EEnumLiteral
+                || (eObject instanceof EPackage && ((EPackage) eObject).getESuperPackage() != null)) {
+            Streams.write(this.createData(eObject), out);
+            return;
+        }
+
+        out.beginObject();
+        Object supplierObject = this.options.get(JsonResource.OPTION_ID_MANAGER);
+        if (supplierObject instanceof IDManager) {
+            out.name(IGsonConstants.ID);
+            out.value(((IDManager) supplierObject).getOrCreateId(eObject));
+        }
+        out.name(IGsonConstants.ECLASS);
+        out.value(this.helper.getQName(eObject.eClass()));
+        this.writeEAllStructuralFeatures(out, eObject);
+        if (this.eObjectHandler != null) {
+            JsonObject extra = new JsonObject();
+            this.eObjectHandler.processSerializedContent(extra, eObject);
+            for (Entry<String, JsonElement> entry : extra.entrySet()) {
+                out.name(entry.getKey());
+                Streams.write(entry.getValue(), out);
+            }
+        }
+        out.endObject();
+    }
+
+    /**
+     * Streaming counterpart of {@link #serializeEAllStructuralFeatures(EObject)}.
+     * Containment references are streamed (their children recurse through
+     * {@link #writeData(JsonWriter, EObject)}); every other feature reuses the
+     * existing element builder, whose value is small.
+     *
+     * @param out
+     *            the writer
+     * @param eObject
+     *            the object whose features are serialized
+     * @throws IOException
+     *             if writing fails
+     */
+    private void writeEAllStructuralFeatures(JsonWriter out, EObject eObject) throws IOException {
+        EClass eClass = eObject.eClass();
+        List<EStructuralFeature> eAllStructuralFeatures = eClass.getEAllStructuralFeatures();
+
+        Object orderFeatures = this.options.get(JsonResource.OPTION_SAVE_FEATURES_ORDER_COMPARATOR);
+        if (orderFeatures instanceof Comparator<?>) {
+            eAllStructuralFeatures = eAllStructuralFeatures.stream() //
+                    .sorted((Comparator<? super EStructuralFeature>) orderFeatures) //
+                    .collect(Collectors.toList());
+        }
+
+        boolean dataStarted = false;
+        for (EStructuralFeature eStructuralFeature : eAllStructuralFeatures) {
+            if (!this.shouldSerialize(eObject, eStructuralFeature)) {
+                continue;
+            }
+            if (eStructuralFeature instanceof EReference && ((EReference) eStructuralFeature).isContainment()) {
+                EReference eReference = (EReference) eStructuralFeature;
+                Object referenceValue = this.helper.getValue(eObject, eReference);
+                if (eReference.isMany()) {
+                    if (referenceValue instanceof Iterable<?>) {
+                        dataStarted = this.beginData(out, dataStarted);
+                        out.name(this.helper.getQName(eStructuralFeature));
+                        out.beginArray();
+                        for (Object object : (Iterable<?>) referenceValue) {
+                            if (object instanceof EObject) {
+                                this.writeData(out, (EObject) object);
+                            }
+                        }
+                        out.endArray();
+                    }
+                } else if (referenceValue instanceof EObject) {
+                    dataStarted = this.beginData(out, dataStarted);
+                    out.name(this.helper.getQName(eStructuralFeature));
+                    EObject child = (EObject) referenceValue;
+                    if ((child instanceof BasicEObjectImpl && ((BasicEObjectImpl) child).eDirectResource() != null)
+                            || child.eResource() != eObject.eResource()) {
+                        out.value(this.removeFragmentSeparator(this.helper.deresolve(EcoreUtil.getURI(child)).toString()));
+                    } else {
+                        this.writeData(out, child);
+                    }
+                }
+            } else {
+                JsonElement value = null;
+                if (eStructuralFeature instanceof EAttribute) {
+                    value = this.serializeEAttribute(eObject, (EAttribute) eStructuralFeature);
+                } else if (eStructuralFeature instanceof EReference) {
+                    value = this.serializeEReference(eObject, (EReference) eStructuralFeature);
+                }
+                if (value != null) {
+                    dataStarted = this.beginData(out, dataStarted);
+                    out.name(this.helper.getQName(eStructuralFeature));
+                    Streams.write(value, out);
+                }
+            }
+        }
+        if (dataStarted) {
+            out.endObject();
+        }
+    }
+
+    /**
+     * Opens the {@code data} object on first use, so it is omitted entirely when
+     * an object has no serialized feature (matching the tree-based builder).
+     *
+     * @param out
+     *            the writer
+     * @param dataStarted
+     *            whether the {@code data} object has already been opened
+     * @return {@code true}, the new started state
+     * @throws IOException
+     *             if writing fails
+     */
+    private boolean beginData(JsonWriter out, boolean dataStarted) throws IOException {
+        if (!dataStarted) {
+            out.name(IGsonConstants.DATA);
+            out.beginObject();
+        }
+        return true;
     }
 
     /**
